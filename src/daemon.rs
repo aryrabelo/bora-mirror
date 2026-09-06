@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Seek, Write};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -38,9 +40,100 @@ fn pid_path(env: &Env) -> PathBuf {
     env.state_dir.join("daemon.pid")
 }
 
-pub fn running_pid(env: &Env) -> Option<i32> {
+fn daemon_lock_path(env: &Env) -> PathBuf {
+    env.state_dir.join("daemon.lock")
+}
+
+fn open_daemon_lock(env: &Env) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(daemon_lock_path(env))?)
+}
+
+fn try_lock(file: &fs::File) -> Result<bool> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(e.into())
+    }
+}
+
+enum DaemonLockState {
+    Unlocked,
+    Locked(Option<i32>),
+}
+
+/// The lifetime lock is authoritative for daemons from this release onward.
+/// Its contents identify the owner so commands can still signal the right
+/// process if daemon.pid is deleted. An unlocked file may contain a stale PID;
+/// the lock state, rather than the file's contents, decides whether it is live.
+fn daemon_lock_state(env: &Env) -> Result<DaemonLockState> {
+    let mut file = open_daemon_lock(env)?;
+    if try_lock(&file)? {
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return Ok(DaemonLockState::Unlocked);
+    }
+    let mut contents = String::new();
+    file.rewind()?;
+    file.read_to_string(&mut contents)?;
+    let pid = contents.trim().parse().ok().filter(|pid| pid_alive(*pid));
+    Ok(DaemonLockState::Locked(pid))
+}
+
+struct DaemonLifetime {
+    _lock: fs::File,
+    pid_file: PathBuf,
+    pid: i32,
+}
+
+impl Drop for DaemonLifetime {
+    fn drop(&mut self) {
+        // Never erase a newer owner's record if shutdowns overlap.
+        let ours = fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            == Some(self.pid);
+        if ours {
+            let _ = fs::remove_file(&self.pid_file);
+        }
+        let _ = unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn acquire_daemon_lifetime(env: &Env) -> Result<DaemonLifetime> {
+    let mut lock = open_daemon_lock(env)?;
+    if !try_lock(&lock)? {
+        return Err(err("mirror daemon already running for this state directory"));
+    }
+    let pid = std::process::id() as i32;
+    lock.set_len(0)?;
+    lock.rewind()?;
+    writeln!(lock, "{pid}")?;
+    lock.flush()?;
+    let guard = DaemonLifetime { _lock: lock, pid_file: pid_path(env), pid };
+    fs::write(&guard.pid_file, pid.to_string())?;
+    Ok(guard)
+}
+
+fn legacy_running_pid(env: &Env) -> Option<i32> {
     let pid: i32 = fs::read_to_string(pid_path(env)).ok()?.trim().parse().ok()?;
     pid_alive(pid).then_some(pid)
+}
+
+pub fn running_pid(env: &Env) -> Option<i32> {
+    match daemon_lock_state(env) {
+        Ok(DaemonLockState::Locked(pid)) => pid,
+        // Compatibility with a daemon started by an older binary, which wrote
+        // daemon.pid but did not hold daemon.lock for its lifetime.
+        Ok(DaemonLockState::Unlocked) | Err(_) => legacy_running_pid(env),
+    }
 }
 
 // Sticky pause marker: blocks the focus-hook autostart until an explicit
@@ -558,10 +651,10 @@ async fn local_events_task(
 // --- commands ---
 
 pub async fn cmd_run(env: Env) -> Result<()> {
+    let _daemon_lifetime = acquire_daemon_lifetime(&env)?;
     let detached = std::env::var("HERDR_MIRROR_DETACHED").is_ok();
     let log = Logger::new(&env.state_dir, !detached);
     let config = load_config(&env.config_search)?;
-    fs::write(pid_path(&env), std::process::id().to_string())?;
     log.log(&format!(
         "daemon starting (pid {}, hosts: {}, config: {})",
         std::process::id(),
@@ -664,34 +757,34 @@ pub async fn cmd_run(env: Env) -> Result<()> {
                 .await;
         }
     }
-    let _ = fs::remove_file(pid_path(&env));
     Ok(())
 }
 
 pub fn cmd_start(env: &Env) -> Result<()> {
-    // flock + parent-written pidfile: two racing starts (focus hook) must not
-    // both see "not running" and spawn duplicate daemons
-    use std::os::fd::AsRawFd;
+    // Serialize launch attempts. The child separately owns daemon.lock for its
+    // full lifetime; this short lock only keeps two `start` calls from both
+    // spawning candidates before either child publishes readiness.
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(env.state_dir.join("daemon.lock"))?;
+        .open(env.state_dir.join("daemon.start.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(err("cannot lock daemon.lock"));
+        return Err(err("cannot lock daemon.start.lock"));
     }
     if running_pid(env).is_some() {
         println!("mirror daemon already running");
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::self_exe_path()
+        .ok_or_else(|| err("cannot locate the herdr-mirror binary to respawn"))?;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(env.state_dir.join("daemon.log"))?;
     let log2 = log.try_clone()?;
     use std::os::unix::process::CommandExt;
-    let child = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(log)
@@ -699,9 +792,18 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .env("HERDR_MIRROR_DETACHED", "1")
         .process_group(0)
         .spawn()?;
-    fs::write(pid_path(env), child.id().to_string())?;
-    println!("mirror daemon started (pid {})", child.id());
-    Ok(())
+    let expected = child.id() as i32;
+    for _ in 0..100 {
+        if running_pid(env) == Some(expected) {
+            println!("mirror daemon started (pid {expected})");
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(err(format!("mirror daemon exited during startup ({status})")));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(err(format!("mirror daemon did not become ready (pid {expected})")))
 }
 
 pub fn cmd_pause(env: &Env) {
@@ -925,6 +1027,50 @@ mod tests {
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1",
         })));
+    }
+
+    fn lock_test_env(tag: &str) -> Env {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-daemon-lock-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        Env { config_search: Vec::new(), state_dir, local_socket: PathBuf::new() }
+    }
+
+    #[test]
+    fn daemon_lifetime_lock_excludes_a_second_owner() {
+        let env = lock_test_env("exclusive");
+        let owner = acquire_daemon_lifetime(&env).unwrap();
+        assert_eq!(running_pid(&env), Some(std::process::id() as i32));
+        assert!(acquire_daemon_lifetime(&env).is_err());
+        drop(owner);
+        assert_eq!(running_pid(&env), None);
+        let _ = fs::remove_dir_all(&env.state_dir);
+    }
+
+    #[test]
+    fn locked_owner_is_recovered_when_pidfile_disappears() {
+        let env = lock_test_env("missing-pidfile");
+        let owner = acquire_daemon_lifetime(&env).unwrap();
+        fs::remove_file(pid_path(&env)).unwrap();
+        assert_eq!(running_pid(&env), Some(std::process::id() as i32));
+        drop(owner);
+        let _ = fs::remove_dir_all(&env.state_dir);
+    }
+
+    #[test]
+    fn lifetime_guard_does_not_remove_a_newer_pidfile() {
+        let env = lock_test_env("new-owner");
+        let owner = acquire_daemon_lifetime(&env).unwrap();
+        fs::write(pid_path(&env), "123456").unwrap();
+        drop(owner);
+        assert_eq!(fs::read_to_string(pid_path(&env)).unwrap(), "123456");
+        let _ = fs::remove_dir_all(&env.state_dir);
     }
 
     /// One fallback is not evidence: the probe also fails when the remote herdr
