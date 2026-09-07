@@ -121,6 +121,15 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// Start the remote server when the host answers ssh but has no bora
+    /// running. Default on: a machine that is up and reachable belongs to the
+    /// fleet, and without this the mirror only reports "remote herdr server is
+    /// not running" and backs off forever — the folder appears solely because
+    /// a human already ran `bora server` over there. Turn it off per host for
+    /// a machine where spawning a server unasked is not acceptable (a
+    /// production VPS, or someone else's box). Only the daemon acts on it;
+    /// `once` and the remote actions never start anything.
+    pub remote_autostart: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +190,7 @@ struct RawConfig {
     state_token: Option<String>,
     down_label: Option<String>,
     always_control: Option<bool>,
+    remote_autostart: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     // toml::Table (preserve_order) keeps declaration order — the first host
@@ -202,6 +212,7 @@ struct RawHost {
     session: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    remote_autostart: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
@@ -284,6 +295,7 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
+    let global_remote_autostart = raw.remote_autostart.unwrap_or(true);
     // 0 is treated as unset rather than "clamp to nothing", same as an empty
     // remote_bin: a cap that would starve the remote of every column is a typo,
     // not an instruction. Warn rather than dropping it silently — and say that
@@ -341,6 +353,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             session: h.session.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            remote_autostart: h.remote_autostart.unwrap_or(global_remote_autostart),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
@@ -420,6 +433,27 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    /// A machine that is up and reachable belongs to the fleet, so the default
+    /// is on — but a production VPS is exactly the host where spawning a
+    /// server unasked is not acceptable, and refusing it must be possible per
+    /// host, not only globally.
+    #[test]
+    fn remote_autostart_defaults_on_and_can_be_refused_per_host() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.hosts[0].remote_autostart, "a reachable machine joins the fleet by default");
+
+        let c = parse_config(
+            "remote_autostart = false\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nremote_autostart = true\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert!(!a.remote_autostart, "inherits the global refusal");
+        assert!(b.remote_autostart, "per-host override wins over the global");
     }
 
     #[test]

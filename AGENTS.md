@@ -80,6 +80,17 @@ a razão do fork existir e nenhum deles é opinião:
   default `frota`) é escrito na transição e limpo na reconexão, sem TTL: um
   aviso que expira sozinho volta a mostrar máquina morta como saudável, e a
   mentira otimista é pior que o aviso velho.
+- **Só o daemon toca em processo de máquina alheia.** `remote_autostart`
+  (default on, override por host) faz o daemon subir um servidor num host que
+  responde ssh e não tem nenhum — sem isso a pasta só aparece se um humano
+  tiver rodado `bora server` lá, e o mirror reporta "not running" e faz
+  backoff pra sempre. `once`, as ações remotas e o CLI **nunca** sobem nada:
+  olhar uma máquina não pode gerar processo nela. Duas coisas seguram a regra:
+  o cooldown de 5 min mora no laço do daemon (um `RemoteHost` novo nasce a cada
+  reconexão, então guardar isso nele viraria um spawn a cada 5s contra uma
+  máquina que não consegue rodar servidor), e o carimbo do cooldown sai da
+  TENTATIVA, não da permissão — host que estava no ar não gasta orçamento só
+  por ser pollado.
 - Sem dependência nova. Sem `unwrap()` em produção. Comentário explica o
   *porquê* (o upstream é rigoroso nisso; mantenha o tom).
 

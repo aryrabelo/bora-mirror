@@ -322,6 +322,16 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # down_label = "⚠ fora do ar"
                          # value written into state_token while the host is
                          # unreachable; cleared on reconnect.
+# remote_autostart = true # default. A host that answers ssh but has no server
+                         # gets one started (`nohup <remote bin> server`), so a
+                         # machine that is up joins the sidebar without anyone
+                         # logging in to run it. One attempt per host per 5
+                         # minutes: a machine that reboots comes back on its
+                         # own, a machine that refuses is not a spawn loop.
+                         # Only the daemon does this — `once` and the remote
+                         # actions never start a process on a machine. Set
+                         # false (globally or per host) for a box where that is
+                         # not acceptable.
 
 [hosts.work]
 target = "work"
@@ -335,6 +345,8 @@ target = "work"
 # max_rows = 58                      # always_control = false
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
+# remote_autostart = false           # per-host refusal: never start a server
+                                     # on this machine (a production box)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 # api_transport = "auto"             # how to reach the remote API socket:
@@ -466,8 +478,12 @@ identified as disposable merely because their directory matches.
 - **No custom sidebar UI** (plugin API limitation): mirrors carry a `<host>: `
   label prefix and the daemon keeps them ordered into per-host groups, but it
   can't render a richer affordance (group headers, collapse, colour).
-- **Remote must be reachable and running herdr**; the daemon surfaces a
-  readable status if a host is down or on too old a version.
+- **Remote must be reachable and running herdr** — with `remote_autostart`
+  (default on) the daemon starts one when the host answers ssh and has none,
+  so "running" is usually its own doing; a host that is down, refuses to start
+  one, or is on too old a version surfaces a readable status instead. A host
+  with no mirror workspaces has no sidebar row, so that state is visible in
+  `herdr-mirror status` and the daemon log, not on a row.
 - **ssh hosts whose sshd won't service streamlocal forwards** (some embedded
   Go sshds fronting container/VM workspaces accept the channel open and then
   never move a byte) fall back automatically to an exec relay — see

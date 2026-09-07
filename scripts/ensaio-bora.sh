@@ -121,6 +121,11 @@ poll_seconds = 60
 autostart = false
 close_remote_on_local_close = false
 always_control = false
+# Os passos 5-6 medem o marcador de host caído, e um ensaio que CURA o host
+# que ele mesmo derruba não mede nada: com autostart ligado o daemon sobe o
+# servidor de volta em ~12s e o token pode ser limpo antes de alguém olhar.
+# O passo 7 liga isto de propósito, com daemon próprio.
+remote_autostart = false
 
 [hosts.$HOST]
 target = "$HOST"
@@ -169,14 +174,41 @@ rem 'nohup ~/.local/bin/bora server </dev/null >/dev/null 2>&1 & sleep 2' >/dev/
 for _ in $(seq 1 40); do [ -z "$(tok)" ] && break; sleep 1; done
 [ -z "$(tok)" ] && pass "token limpo na reconexão" || fail "aviso ficou colado: '$(tok)'"
 
-step "7. teardown não vaza ControlMaster"
+step "7. autostart: máquina sem servidor volta sozinha"
+# O daemon dos passos 5-6 sai antes: o pidfile é um lock por máquina (dentro
+# do state do ensaio), então um segundo daemon não sobe enquanto o primeiro
+# vive — e "não subiu" leria como "autostart não funciona".
 kill "$dpid" 2>/dev/null; wait "$dpid" 2>/dev/null
+python3 - "$PLUGCFG/hosts.toml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+assert "remote_autostart = false" in s, "o passo 2 tem que ter escrito o knob desligado"
+open(p, "w").write(s.replace("remote_autostart = false", "remote_autostart = true", 1))
+PY
+rem '~/.local/bin/bora server stop' >/dev/null 2>&1
+sleep 1
+rem '~/.local/bin/bora status --json' 2>/dev/null | grep -q '"running":true' \
+  && { fail "o remoto não caiu — o resto do passo não mede nada"; }
+mir daemon >>/tmp/.ensaio-daemon.log 2>&1 &
+apid=$!
+healed=false
+for _ in $(seq 1 45); do
+  rem '~/.local/bin/bora status --json' 2>/dev/null | grep -q '"running":true' \
+    && { healed=true; break; }
+  sleep 1
+done
+kill "$apid" 2>/dev/null; wait "$apid" 2>/dev/null
+$healed && pass "host sem servidor voltou sozinho" \
+  || fail "autostart não subiu servidor no $HOST (nada mudou sem humano)"
+
+step "8. teardown não vaza ControlMaster"
 mir teardown 2>&1 | tail -2
 sleep 2
 n="$(orphans)"
 [ "$n" = "0" ] && pass "zero ssh órfão depois do teardown" || fail "$n ControlMaster órfão(s) sobrando"
 
-step "8. restauração"
+step "9. restauração"
 if ! $remote_was_up; then rem '~/.local/bin/bora server stop' >/dev/null 2>&1; fi
 ens session stop "$NS" >/dev/null 2>&1
 ens server stop >/dev/null 2>&1

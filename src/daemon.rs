@@ -277,6 +277,21 @@ fn remember_transport(
     }
 }
 
+/// How long a host waits before it may be handed another start attempt.
+///
+/// The reconnect backoff caps at 30s, so without a separate clock a machine
+/// that answers ssh and refuses to run a server would take an ssh handshake
+/// and a spawn every half minute, forever. Five minutes is short enough that
+/// a machine rebooting is back in the sidebar on its own and long enough that
+/// a refusal is not a loop.
+const AUTOSTART_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// May this attempt start a server on the remote? The whole rule, with the
+/// clock passed in.
+fn autostart_allowed(enabled: bool, since_last: Option<std::time::Duration>) -> bool {
+    enabled && since_last.is_none_or(|d| d >= AUTOSTART_COOLDOWN)
+}
+
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
 /// until the connection drops (returns Err).
 async fn run_connected(
@@ -286,6 +301,7 @@ async fn run_connected(
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
     link: &mut LinkState,
+    last_autostart: &mut Option<std::time::Instant>,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -293,7 +309,17 @@ async fn run_connected(
     // would otherwise be re-probed via streamlocal on every single reconnect
     // for the life of the daemon
     remote_host.hint_transport(*remembered_transport);
-    let (remote, _status) = remote_host.connect_api().await?;
+    remote_host.allow_autostart(autostart_allowed(
+        ctx.host.remote_autostart,
+        last_autostart.map(|t| t.elapsed()),
+    ));
+    let connected = remote_host.connect_api().await;
+    // stamped from the ATTEMPT, not from the permission: a host that was up
+    // must not spend its budget just by being polled.
+    if remote_host.autostart_attempted() {
+        *last_autostart = Some(std::time::Instant::now());
+    }
+    let (remote, _status) = connected?;
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
     let deps = ConvergeDeps {
@@ -419,6 +445,11 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     // `Unknown` so the first connect clears a marker a previous daemon may
     // have left written on the server (see `LinkState`).
     let mut link = LinkState::Unknown;
+    // Last time this host was handed a start attempt. Lives here, not on
+    // `RemoteHost`, because a fresh one is built per reconnect — and the
+    // reconnect loop is exactly what would turn one attempt into a spawn
+    // every 5 seconds against a machine that cannot run a server.
+    let mut last_autostart: Option<std::time::Instant> = None;
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -439,6 +470,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &mut remembered_transport,
             &mut exec_streak,
             &mut link,
+            &mut last_autostart,
         )
         .await
         {
@@ -1052,6 +1084,50 @@ mod tests {
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1",
         })));
+    }
+
+    /// The rule that keeps "a machine that is up belongs to the fleet" from
+    /// becoming "spawn a process on someone's box every 30 seconds". Both
+    /// halves matter: the config knob is the only way to refuse a start on a
+    /// production box, and the cooldown is what a reconnect loop cannot
+    /// out-run.
+    #[test]
+    fn autostart_is_gated_by_the_knob_and_by_the_cooldown() {
+        use std::time::Duration;
+        assert!(autostart_allowed(true, None), "a host never tried yet gets one attempt");
+        assert!(
+            !autostart_allowed(false, None),
+            "remote_autostart = false must refuse even the first attempt"
+        );
+        assert!(
+            !autostart_allowed(true, Some(AUTOSTART_COOLDOWN - Duration::from_secs(1))),
+            "inside the cooldown the reconnect loop must not spend another attempt"
+        );
+        assert!(
+            autostart_allowed(true, Some(AUTOSTART_COOLDOWN)),
+            "a machine that reboots must come back on its own"
+        );
+    }
+
+    /// The remote command is a cross-machine contract: ssh waits for EOF on
+    /// the remote's stdout AND stderr, so a server that inherits either one
+    /// holds this ssh child open for as long as it runs — which for a headless
+    /// server means the connect attempt that started it never returns.
+    #[test]
+    fn the_start_command_cannot_hold_the_ssh_child_open() {
+        let cmd = crate::remote::start_server_command("BIN");
+        assert!(cmd.contains("BIN server"), "must run the resolved binary's server: {cmd}");
+        assert!(cmd.contains("</dev/null"), "stdin must not be the ssh channel: {cmd}");
+        assert!(cmd.contains(">/dev/null"), "stdout must be redirected: {cmd}");
+        assert!(cmd.contains("2>&1"), "stderr must be redirected: {cmd}");
+        // `contains('&')` is NOT enough and was wrong here first: `2>&1`
+        // supplies an `&`, so dropping the background operator entirely left
+        // this assertion green (measured by mutation). Take the fd dup out
+        // before looking for the operator.
+        assert!(
+            cmd.replace("2>&1", "").contains('&'),
+            "the job must be backgrounded — the only & is the fd dup: {cmd}"
+        );
     }
 
     fn lock_test_env(tag: &str) -> Env {

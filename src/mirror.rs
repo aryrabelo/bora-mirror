@@ -2083,6 +2083,7 @@ mod tests {
             remote_bin: None,
             session: None,
             always_control: true,
+            remote_autostart: true,
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,

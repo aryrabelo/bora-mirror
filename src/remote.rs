@@ -40,6 +40,11 @@ pub struct RemoteStatus {
     pub socket: String,
     pub supported: bool,
     pub reason: Option<String>,
+    /// The host answered, and there is simply no server there. Distinct from
+    /// every other unsupported reason (version too old, unparseable version):
+    /// this is the only one starting a server can fix, and the daemon is the
+    /// only caller allowed to act on it.
+    pub not_running: bool,
 }
 
 struct SshOutput {
@@ -135,6 +140,17 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
     })
 }
 
+/// The remote command that leaves a server running after ssh has returned.
+///
+/// Every fd is redirected and the job is backgrounded, and neither half is
+/// optional: ssh waits for EOF on the remote command's stdout and stderr, so
+/// a server that inherits them holds the ssh child open — and for a headless
+/// server that never ends, which would hang the connect attempt that started
+/// it instead of letting the next one find a live server.
+pub(crate) fn start_server_command(bin_expr: &str) -> String {
+    format!("nohup {bin_expr} server </dev/null >/dev/null 2>&1 & exit 0")
+}
+
 pub struct RemoteHost {
     pub cfg: HostConfig,
     ctl_path: PathBuf,
@@ -164,6 +180,15 @@ pub struct RemoteHost {
     /// ssh hosts only: which transport this connection actually used, so the
     /// daemon can feed it back into the next `RemoteHost`'s `hint_transport`.
     pub last_api_transport: Option<ApiTransport>,
+    /// daemon-only opt-in: may this attempt start a server on the remote when
+    /// the host answers and has none? A fresh `RemoteHost` is built on every
+    /// reconnect (see `transport_hint`), so the cooldown that keeps this from
+    /// becoming a spawn loop cannot live here — it lives in the daemon's host
+    /// loop, which is why this is set per attempt instead of read from config.
+    autostart_allowed: bool,
+    /// set when an attempt was actually fired, so the daemon starts its
+    /// cooldown from the attempt and not from the decision to allow one.
+    autostart_attempted: bool,
     log: Logger,
 }
 
@@ -313,6 +338,8 @@ impl RemoteHost {
             exec_relay: None,
             exec_sock: state_dir.join(format!("{stem}-api-exec.sock")),
             last_api_transport: None,
+            autostart_allowed: false,
+            autostart_attempted: false,
             log: Logger::new(state_dir, false),
         }
     }
@@ -327,6 +354,37 @@ impl RemoteHost {
                 self.transport_hint = h;
             }
         }
+    }
+
+    /// Let THIS attempt start a server on the remote if the host answers and
+    /// has none. Off unless the daemon says otherwise: `once`, the remote
+    /// actions and the CLI must never spawn a process on someone's machine as
+    /// a side effect of looking at it.
+    pub fn allow_autostart(&mut self, allowed: bool) {
+        self.autostart_allowed = allowed && !self.cfg.kind.is_docker();
+    }
+
+    /// Did this attempt actually fire a start? Read after a failed
+    /// `connect_api`, since that is the path that fires one.
+    pub fn autostart_attempted(&self) -> bool {
+        self.autostart_attempted
+    }
+
+    /// Start a server on the remote and leave it running after ssh returns.
+    ///
+    /// The remote binary (and `--session`, when configured) comes from the
+    /// same resolver every other remote command uses, so a machine whose bora
+    /// is only in `~/.local/bin` is reached here too.
+    pub async fn start_server(&self) -> Result<()> {
+        if self.cfg.kind.is_docker() {
+            return Err(err("a docker host has no server to start"));
+        }
+        let bin = crate::config::remote_herdr_expr(
+            self.cfg.remote_bin.as_deref(),
+            self.cfg.session.as_deref(),
+        );
+        self.exec(&start_server_command(&bin), 15000).await?;
+        Ok(())
     }
 
     /// Bring the transport up: an ssh ControlMaster, or a resolved container.
@@ -457,12 +515,14 @@ impl RemoteHost {
             .unwrap_or_else(|| "unknown".into());
         let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
         let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
-        let mut status = RemoteStatus { socket, supported: false, reason: None };
+        let mut status =
+            RemoteStatus { socket, supported: false, reason: None, not_running: false };
         if !running {
             // Name the session, or this reads as "that machine's herdr is
             // down" while the default session is running perfectly and only
             // the configured one is stopped — which is the common way to get
             // here once `session` is in play (a typo, or `herdr session stop`).
+            status.not_running = true;
             status.reason = Some(match &self.cfg.session {
                 Some(name) => format!("remote herdr session {name:?} is not running"),
                 None => "remote herdr server is not running".into(),
@@ -625,7 +685,22 @@ impl RemoteHost {
             }
         };
         if !status.supported {
-            return Err(err(status.reason.clone().unwrap_or_else(|| "remote unsupported".into())));
+            let reason = status.reason.clone().unwrap_or_else(|| "remote unsupported".into());
+            // Only "there is no server" is fixable by starting one, and only
+            // for a caller that asked to be allowed to. Returning Err either
+            // way is deliberate: the daemon's own backoff is the retry, so the
+            // next attempt finds a live server instead of this one blocking on
+            // a readiness poll it would have to invent.
+            if status.not_running && self.autostart_allowed {
+                self.autostart_attempted = true;
+                self.log
+                    .log(&format!("[{}] no server there — starting one", self.cfg.name));
+                return match self.start_server().await {
+                    Ok(()) => Err(err(format!("{reason} — started one, reconnecting"))),
+                    Err(e) => Err(err(format!("{reason}; could not start one: {e}"))),
+                };
+            }
+            return Err(err(reason));
         }
         // ssh hosts hand back a connected client (its ping doubles as the
         // transport probe); the docker branch resolves a path and connects below
@@ -715,6 +790,7 @@ mod tests {
             max_rows: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
+            remote_autostart: true,
         }
     }
 
