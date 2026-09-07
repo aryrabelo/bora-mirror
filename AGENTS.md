@@ -17,7 +17,7 @@ lá.
 
 ## O contrato deste fork
 
-Quatro defeitos de encaixe, todos medidos contra máquina real (2026-09-07). São
+Cinco defeitos de encaixe, todos medidos contra máquina real (2026-09-07). São
 a razão do fork existir e nenhum deles é opinião:
 
 1. **O binário local não se chama `herdr`.** `HERDR_MIRROR_LOCAL_BIN` manda; sem
@@ -45,6 +45,19 @@ a razão do fork existir e nenhum deles é opinião:
    isto está morta por medição (ceo-bora#167): custaria 3 quebras de
    compilação, 11 guardas herdadas em silêncio e 3 goldens de frame, para
    entregar o que uma linha entrega.
+5. **O binário tem que estar em `./target/release/herdr-mirror`, e nesta frota
+   não estaria.** As ~20 linhas de `command` do `herdr-plugin.toml` são
+   relativas à raiz do plugin, e `~/.cargo/config.toml` desta máquina pina um
+   `target-dir` GLOBAL — então `cargo build --release` nu escreve em
+   `~/.cargo/target` e o caminho prometido nunca existe. Medido: `bora plugin
+   link` **não** roda `[[build]]` (`src/cli/plugin.rs`, `plugin_link` só
+   valida o manifesto e registra), então o binário precisa estar lá ANTES do
+   link; `plugin install` roda, e cai no `scripts/install.sh`, que neste fork
+   não tem Release para baixar. Daí `--target-dir target` explícito em toda
+   invocação e o fallback de compilar do source no `install.sh` — com o
+   MISMATCH de checksum seguindo `fail` duro, porque cair pra build num
+   download adulterado transformaria o único sinal de segurança do script num
+   aviso que ninguém lê.
 
 ## Regras de código deste fork
 
@@ -73,9 +86,9 @@ a razão do fork existir e nenhum deles é opinião:
 ## Verificação
 
 ```bash
-cargo test  --target-dir target-fork      # 230 testes, ~1s
-cargo build --release --target-dir target-fork
-scripts/ensaio-bora.sh work               # ensaio contra máquina real, ~50s
+cargo test  --target-dir target              # 231 testes, ~1s
+cargo build --release --target-dir target
+scripts/ensaio-bora.sh work                  # ensaio contra máquina real, ~25s
 ```
 
 **`--target-dir` explícito não é preciosismo.** `CARGO_TARGET_DIR` é global
@@ -85,6 +98,20 @@ upstream acreditando que mediu o fork. `scripts/ensaio-bora.sh` prova qual
 binário tem na mão por um símbolo que só este fork contém, e o script carrega,
 em comentário, as outras duas armadilhas medidas (registro de plugin é global
 por NAMESPACE e não por sessão; não existe `bora server start`).
+
+**O ensaio roda COM a instalação viva no ar, e é isso que o torna honesto.**
+O state (id map, tombstones, pidfile) é fixo por máquina de propósito, então um
+ensaio que dividisse esse diretório leria um mapa cujos ids locais são da
+sessão viva, tombstonearia os espelhos dela e não subiria daemon nenhum (o
+vivo segura o lock) — foi exatamente o que aconteceu no minuto seguinte ao
+primeiro link de verdade, e até ali o ensaio só passava porque era o único
+mirror da máquina. `HERDR_MIRROR_STATE_DIR` existe para esse único chamador.
+Duas consequências que não são detalhe: contar ControlMaster órfão pelo nome
+do binário acusa o master legítimo do daemon vivo, então conte só os que estão
+sob o state do ensaio; e o state vivo **não** pode ser comparado por hash,
+porque o daemon vivo reage de verdade ao host caindo que o próprio ensaio
+provoca — o que tem de sobreviver é observável na sessão viva (mesmos
+espelhos, mesmos ids, mesmo daemon), e o passo 8 confere isso.
 
 Ao mudar regra defendida por teste, prove que o teste acusa: mutação por
 regra, uma por vez, cada uma reddening o teste NOMEADO. Foi assim que as três
@@ -101,7 +128,7 @@ esperadas, todas do mesmo rename:
   arquivo (`herdr-mirror`) e identificadores internos em paz.
 - `remote_herdr_expr` e `config_candidates` são os dois pontos que o upstream
   mais mexe e que este fork reescreveu. Reaplique a lista de candidatos.
-- Depois de qualquer merge: `cargo test --target-dir target-fork` e
+- Depois de qualquer merge: `cargo test --target-dir target` e
   `scripts/ensaio-bora.sh work`. O ensaio é o que pega regressão de encaixe;
   os testes não falam com máquina nenhuma.
 

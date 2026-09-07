@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Fetch the prebuilt herdr-mirror binary for this platform from GitHub
 # Releases, verified against SHA256SUMS. Run by the herdr plugin [[build]]
-# step with cwd = plugin root. No cargo fallback: dev installs (herdr plugin
-# link) build with `cargo build --release` themselves.
+# step with cwd = plugin root.
+#
+# This fork publishes no Releases, so building is the normal path, not an
+# exotic fallback. A checksum MISMATCH still stops the world: falling back to
+# a build on a tampered download would turn the one loud security signal in
+# this script into a warning nobody reads.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -10,8 +14,24 @@ DEST="target/release/herdr-mirror"
 
 fail() {
   echo "herdr-mirror fetch failed: $1" >&2
-  echo "to build from source instead: cargo build --release" >&2
+  echo "to build from source instead: cargo build --release --target-dir target" >&2
   exit 1
+}
+
+# `--target-dir target` is load-bearing, not fussiness: this fleet's
+# ~/.cargo/config.toml pins a GLOBAL target-dir, so a bare `cargo build` writes
+# to ~/.cargo/target and `./target/release/herdr-mirror` — the path the ~20
+# `command` lines in herdr-plugin.toml promise — never exists. Measured
+# 2026-09-07: `bora plugin link` does NOT run [[build]], so the binary must
+# already be there; `plugin install` does run it, and lands here.
+FROM_SOURCE=0
+from_source() {
+  echo "herdr-mirror: $1" >&2
+  command -v cargo >/dev/null 2>&1 || fail "no prebuilt asset, and no cargo to build one"
+  cargo build --release --target-dir target || fail "cargo build --release failed"
+  [ -x "$DEST" ] || fail "cargo build reported success but $DEST is missing"
+  echo "built $DEST from source"
+  FROM_SOURCE=1
 }
 
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -49,20 +69,27 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "fetching ${BASE}/${ASSET}"
-curl -fsSL --retry 2 -o "${TMP}/${ASSET}" "${BASE}/${ASSET}" || fail "download failed: ${BASE}/${ASSET}"
-curl -fsSL --retry 2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS" || fail "download failed: ${BASE}/SHA256SUMS"
+if ! curl -fsSL --retry 2 -o "${TMP}/${ASSET}" "${BASE}/${ASSET}"; then
+  from_source "no asset at ${BASE}/${ASSET}"
+elif ! curl -fsSL --retry 2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS"; then
+  from_source "no SHA256SUMS at ${BASE}/SHA256SUMS"
+fi
 
-# Look the hash up first, so a release missing this asset can't be reported as
-# a corrupt download: under `pipefail` a no-match grep fails the whole pipeline
-# and would otherwise land on the mismatch message below.
-EXPECTED="$(grep " ${ASSET}\$" "${TMP}/SHA256SUMS")" ||
-  fail "${ASSET} is not listed in SHA256SUMS — the v${VERSION} release looks incomplete"
-(cd "$TMP" && printf '%s\n' "$EXPECTED" | sha256_check) ||
-  fail "checksum MISMATCH for ${ASSET} — the download is corrupt or tampered with; do not use it"
+if [ "$FROM_SOURCE" = 0 ]; then
+  # Look the hash up first, so a release missing this asset can't be reported as
+  # a corrupt download: under `pipefail` a no-match grep fails the whole pipeline
+  # and would otherwise land on the mismatch message below.
+  EXPECTED="$(grep " ${ASSET}\$" "${TMP}/SHA256SUMS")" ||
+    from_source "${ASSET} is not listed in SHA256SUMS — the v${VERSION} release looks incomplete"
+fi
 
-mkdir -p "$(dirname "$DEST")"
-install -m 755 "${TMP}/${ASSET}" "$DEST"
-echo "installed ${ASSET} v${VERSION} at ${DEST}"
+if [ "$FROM_SOURCE" = 0 ]; then
+  (cd "$TMP" && printf '%s\n' "$EXPECTED" | sha256_check) ||
+    fail "checksum MISMATCH for ${ASSET} — the download is corrupt or tampered with; do not use it"
+  mkdir -p "$(dirname "$DEST")"
+  install -m 755 "${TMP}/${ASSET}" "$DEST"
+  echo "installed ${ASSET} v${VERSION} at ${DEST}"
+fi
 
 # Link the CLI at the stable path the README documents. Keybindings must use
 # the absolute ~/.local/bin/herdr-mirror (herdr runs shell bindings through a

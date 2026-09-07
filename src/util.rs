@@ -42,7 +42,8 @@ pub fn herdr_namespace() -> String {
 
 /// Resolved runtime environment. Config is searched across candidate dirs so
 /// shell and plugin-action invocations agree (see `config_candidates`); state
-/// is ALWAYS the fixed path so both share one id map and pidfile.
+/// is the fixed path unless `HERDR_MIRROR_STATE_DIR` says otherwise, so shell
+/// and plugin share one id map and pidfile by default (see `state_dir`).
 pub struct Env {
     /// config dirs to search, in order (see `config_candidates`)
     pub config_search: Vec<PathBuf>,
@@ -53,7 +54,7 @@ pub struct Env {
 impl Env {
     pub fn resolve() -> Result<Env> {
         let config_search = config_candidates();
-        let state_dir = home_dir().join(".local").join("state").join("herdr-mirror");
+        let state_dir = state_dir();
         // create only the canonical dir; the others are probed, not owned
         fs::create_dir_all(default_config_dir())?;
         fs::create_dir_all(&state_dir)?;
@@ -230,6 +231,33 @@ pub fn repair_cli_link() -> Option<String> {
         Ok(()) => format!("relinked {} -> {}", link.display(), exe.display()),
         Err(e) => format!("could not relink {}: {e}", link.display()),
     })
+}
+
+/// Where the id map, tombstones and the daemon pidfile live.
+///
+/// One fixed path per machine is the design: a shell invocation and a plugin
+/// action must find the SAME map, and the pidfile is what keeps a second
+/// daemon from fighting the first one for the same hosts.
+///
+/// That is also why a trial harness cannot just point at a throwaway session:
+/// with the plugin really installed, an isolated session sharing this dir
+/// reads a map whose local ids belong to the LIVE session, decides its
+/// mirrors were "closed locally", tombstones them — and never starts, because
+/// the live daemon holds the lock. `HERDR_MIRROR_STATE_DIR` exists for that
+/// one caller (`scripts/ensaio-bora.sh`); unset is the only supported state
+/// for a real install, and the default is unchanged.
+pub fn state_dir() -> PathBuf {
+    let injected = std::env::var("HERDR_MIRROR_STATE_DIR").ok().filter(|d| !d.is_empty());
+    state_dir_for(injected.as_deref(), &home_dir())
+}
+
+/// The rule itself, with every environment fact passed in so it can be tested
+/// without mutating process-global state.
+fn state_dir_for(injected: Option<&str>, home: &Path) -> PathBuf {
+    match injected {
+        Some(dir) => PathBuf::from(dir),
+        None => home.join(".local").join("state").join("herdr-mirror"),
+    }
 }
 
 /// Config dirs to search, most specific first.
@@ -576,6 +604,25 @@ mod tests {
             dirs.iter().filter(|d| *d == &canonical).count(),
             1,
             "a duplicate makes the daemon warn it is ignoring the file it reads: {dirs:?}"
+        );
+    }
+
+    /// A real install must keep one map and one pidfile per machine, so an
+    /// unset (or empty) override has to land on the fixed path — an override
+    /// that leaked a default would silently give the shell and the plugin two
+    /// different maps. The trial harness is the only caller that sets it.
+    #[test]
+    fn state_dir_is_fixed_unless_a_trial_overrides_it() {
+        let home = PathBuf::from("/home/u");
+        let fixed = home.join(".local/state/herdr-mirror");
+        assert_eq!(state_dir_for(None, &home), fixed);
+        assert_eq!(state_dir_for(Some("/tmp/ensaio/state"), &home), PathBuf::from("/tmp/ensaio/state"));
+        // `Env::resolve` filters an empty var before it gets here; assert the
+        // filter's contract at the boundary that actually reads the var.
+        assert_eq!(
+            std::env::var("HERDR_MIRROR_STATE_DIR").ok().filter(|d| !d.is_empty()),
+            None,
+            "the suite must not run with the trial override set"
         );
     }
 
