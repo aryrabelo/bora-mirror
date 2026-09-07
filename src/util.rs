@@ -32,6 +32,14 @@ pub fn herdr_config_path() -> PathBuf {
     }
 }
 
+/// The herdr/bora config namespace: the directory name under `~/.config`.
+/// Mirrors the local server's own rule (`HERDR_NAMESPACE`, else the binary's
+/// default), which is what decides where `config.toml` and the plugin dirs
+/// live. Empty is treated as unset, like every other env var here.
+pub fn herdr_namespace() -> String {
+    std::env::var("HERDR_NAMESPACE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "bora".into())
+}
+
 /// Resolved runtime environment. Config is searched across candidate dirs so
 /// shell and plugin-action invocations agree (see `config_candidates`); state
 /// is ALWAYS the fixed path so both share one id map and pidfile.
@@ -234,14 +242,34 @@ pub fn repair_cli_link() -> Option<String> {
 /// README-following user (who is told to use `herdr plugin config-dir mirror`)
 /// gets the same answer in both modes.
 pub fn config_candidates() -> Vec<PathBuf> {
+    let injected = std::env::var("HERDR_PLUGIN_CONFIG_DIR").ok().filter(|d| !d.is_empty());
+    candidate_dirs(injected.as_deref(), &herdr_namespace(), &home_dir(), &default_config_dir())
+}
+
+/// The ordering rule itself, with every environment fact passed in so it can
+/// be tested without mutating process-global state.
+fn candidate_dirs(
+    injected: Option<&str>,
+    namespace: &str,
+    home: &Path,
+    canonical: &Path,
+) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(dir) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
-        if !dir.is_empty() {
-            dirs.push(PathBuf::from(dir));
-        }
+    if let Some(dir) = injected {
+        dirs.push(PathBuf::from(dir));
     }
-    dirs.push(home_dir().join(".config/herdr/plugins/config/mirror"));
-    dirs.push(default_config_dir());
+    // The fork's local server is `bora` and its config dir follows the same
+    // namespace, so the conventional plugin dir on a bora fleet is
+    // ~/.config/bora/plugins/config/mirror, not ~/.config/herdr/... Probing
+    // only the upstream name made `herdr-mirror status` typed in a shell read
+    // an empty dir and answer "no hosts" while the daemon — which gets
+    // HERDR_PLUGIN_CONFIG_DIR injected — was mirroring happily from the real
+    // file. All names are probed: an upstream install still resolves, and a
+    // custom HERDR_NAMESPACE (what bora itself honours) is respected.
+    for ns in [namespace, "bora", "herdr"] {
+        dirs.push(home.join(format!(".config/{ns}/plugins/config/mirror")));
+    }
+    dirs.push(canonical.to_path_buf());
     // NOT Vec::dedup, which only collapses *consecutive* duplicates: with
     // HERDR_PLUGIN_CONFIG_DIR set to the canonical dir the list is
     // [canonical, plugin, canonical], so the duplicates are not adjacent and
@@ -515,6 +543,40 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// The dir a human's shell reaches must be the dir the injected daemon
+    /// reaches. This fork's server is `bora`, so probing only the upstream
+    /// `herdr` namespace made `herdr-mirror status` answer "no hosts" against
+    /// a real, working config (measured on a bora fleet, 2026-09-07).
+    #[test]
+    fn a_shell_finds_the_config_under_the_servers_own_namespace() {
+        let home = PathBuf::from("/home/u");
+        let canonical = PathBuf::from("/home/u/.config/herdr/plugins/config/mirror");
+        let rel = |dirs: &[PathBuf], ns: &str| {
+            dirs.iter().position(|d| d == &home.join(format!(".config/{ns}/plugins/config/mirror")))
+        };
+
+        // No injected var: this is the shell case, and it must still resolve.
+        let dirs = candidate_dirs(None, "bora", &home, &canonical);
+        let bora = rel(&dirs, "bora").expect("the bora namespace dir must be probed");
+        let herdr = rel(&dirs, "herdr").expect("upstream installs must keep working");
+        assert!(bora < herdr, "the server's own namespace comes first: {dirs:?}");
+
+        // A custom namespace is bora's own rule, so it must win over both.
+        let dirs = candidate_dirs(None, "work", &home, &canonical);
+        assert_eq!(rel(&dirs, "work"), Some(0), "HERDR_NAMESPACE first: {dirs:?}");
+        assert!(rel(&dirs, "bora").is_some() && rel(&dirs, "herdr").is_some());
+
+        // Injected dir wins outright, and appears exactly once even when it
+        // is also the canonical dir.
+        let dirs = candidate_dirs(Some(canonical.to_str().unwrap()), "bora", &home, &canonical);
+        assert_eq!(dirs[0], canonical);
+        assert_eq!(
+            dirs.iter().filter(|d| *d == &canonical).count(),
+            1,
+            "a duplicate makes the daemon warn it is ignoring the file it reads: {dirs:?}"
+        );
     }
 
     #[test]
