@@ -26,10 +26,11 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
-use crate::config::{load_config, HostConfig};
+use crate::config::{load_config, HostConfig, MirrorConfig};
 use crate::mirror::{
-    apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    teardown, AgentInfo, ConvergeDeps,
+    apply_remote_closes, converge, mark_unknown, mirror_source, mirror_workspace_ids,
+    publish_token_ops, push_pane_status, regroup_sidebar, teardown, token_ops, AgentInfo,
+    ConvergeDeps, LinkState,
 };
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
@@ -161,7 +162,7 @@ struct HostCtx {
     host: HostConfig,
     local: ApiClient,
     log: Logger,
-    close_remote_on_local_close: bool,
+    config: MirrorConfig,
     closes: crate::closes::Closes,
 }
 
@@ -284,6 +285,7 @@ async fn run_connected(
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
+    link: &mut LinkState,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -300,7 +302,7 @@ async fn run_connected(
         host: ctx.host.clone(),
         state_dir: ctx.env_state_dir.clone(),
         log: ctx.log.clone(),
-        close_remote_on_local_close: ctx.close_remote_on_local_close,
+        close_remote_on_local_close: ctx.config.close_remote_on_local_close,
         closes: ctx.closes.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
@@ -310,6 +312,12 @@ async fn run_connected(
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
+    // Clear the host's down marker now that its rows are real again — after
+    // converge, so a first connect sees the workspaces it just created.
+    let ids = mirror_workspace_ids(&state);
+    let ops = token_ops(link, &LinkState::Up, &ctx.config, &ids);
+    publish_token_ops(&ctx.local, &ctx.host.name, &ctx.config.state_token, &ops, &ctx.log).await;
+    *link = LinkState::Up;
 
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
@@ -407,6 +415,10 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
+    // Sidebar link state, per host, for the daemon's whole life. Starts
+    // `Unknown` so the first connect clears a marker a previous daemon may
+    // have left written on the server (see `LinkState`).
+    let mut link = LinkState::Unknown;
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -426,6 +438,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
+            &mut link,
         )
         .await
         {
@@ -434,6 +447,15 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         };
         mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
             .await;
+        // Host-level, unlike `mark_unknown` above: that one reaches only panes
+        // carrying a reported agent, and the pane's own "reconnecting in Ns"
+        // row is invisible until someone opens the mirror. This lands on the
+        // sidebar row itself.
+        let ids = mirror_workspace_ids(&load_state(&ctx.env_state_dir, &ctx.host.name));
+        let ops = token_ops(&link, &LinkState::Down, &ctx.config, &ids);
+        publish_token_ops(&ctx.local, &ctx.host.name, &ctx.config.state_token, &ops, &ctx.log)
+            .await;
+        link = LinkState::Down;
         // starts_with, not contains: the marker is always emitted as a prefix,
         // while the error text can embed user strings (target, remote_bin). A
         // substring test would make an ssh host named `dormant-box` back off
@@ -697,7 +719,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             host: h.clone(),
             local: local.clone(),
             log: log.clone(),
-            close_remote_on_local_close: config.close_remote_on_local_close,
+            config: config.clone(),
             closes: closes.clone(),
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
@@ -1006,6 +1028,9 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         teardown(&local, &env.state_dir, &h.name, &log, None).await?;
+        // Nothing of ours will dial this host again until an explicit start, so
+        // the shared ssh ControlMaster it left behind is an orphan.
+        crate::remote::close_control_master(h, &env.state_dir, &log).await;
     }
     log.log("teardown complete (autostart paused until next start)");
     Ok(())

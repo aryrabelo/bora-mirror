@@ -243,6 +243,62 @@ pub(crate) fn control_path(state_dir: &std::path::Path, host_name: &str) -> Path
     state_dir.join(format!("{}.ctl", socket_stem(state_dir, host_name)))
 }
 
+/// argv for shutting a host's ControlMaster down.
+///
+/// `None` for docker hosts: `docker exec` is local, so they never open a
+/// master to close (see `foreground.rs`).
+fn control_exit_argv(host: &HostConfig, ctl: &Path) -> Option<Vec<String>> {
+    if host.kind.is_docker() {
+        return None;
+    }
+    Some(vec![
+        "-O".into(),
+        "exit".into(),
+        "-S".into(),
+        ctl.display().to_string(),
+        // never prompt: teardown can run unattended from a plugin action
+        "-o".into(),
+        "BatchMode=yes".into(),
+        host.target.clone(),
+    ])
+}
+
+/// Shut a host's ControlMaster down, best-effort.
+///
+/// `ensure_master` starts it with `ControlPersist=yes`, which means forever:
+/// the master outlives teardown, the daemon exiting, and even the state dir
+/// being deleted, so without this each teardown strands one idle ssh per host
+/// that only a manual signal reaches. Failing teardown over socket cleanup
+/// would be worse than the leak, so every error is logged and swallowed.
+pub async fn close_control_master(host: &HostConfig, state_dir: &Path, log: &Logger) {
+    let ctl = control_path(state_dir, &host.name);
+    let Some(argv) = control_exit_argv(host, &ctl) else {
+        return;
+    };
+    // a host that never connected has no socket; saying so would read as a
+    // teardown fault
+    if !ctl.exists() {
+        return;
+    }
+    // short timeout: the master is local, and a hung mux must not hold up the
+    // rest of teardown
+    let res = ssh(&argv, 2000).await;
+    // `-O exit` unlinks the socket itself, but a master that already died
+    // leaves the file behind and the next `ensure_master` must not find it
+    let stale = remove_stale_control_socket(&ctl);
+    if res.code != 0 {
+        log.log(&format!(
+            "[{}] could not close ssh control master: {}",
+            host.name,
+            nonempty(&res.err, res.code)
+        ));
+    } else if let Err(e) = stale {
+        log.log(&format!("[{}] closed ssh control master, but {e}", host.name));
+    } else {
+        log.log(&format!("[{}] closed ssh control master", host.name));
+    }
+}
+
 impl RemoteHost {
     pub fn new(cfg: &HostConfig, state_dir: &std::path::Path) -> RemoteHost {
         let stem = socket_stem(state_dir, &cfg.name);
@@ -797,6 +853,77 @@ mod tests {
         assert!(error.contains("is not a socket"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "do not delete");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn control_exit_argv_targets_the_hosts_own_socket() {
+        let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
+        let host = ssh_host("work");
+        let ctl = control_path(&state_dir, "work");
+        let ctl_arg = ctl.display().to_string();
+
+        let args = control_exit_argv(&host, &ctl).expect("ssh hosts have a master");
+
+        // `-O exit` is what kills the ControlPersist=yes master; `-O stop` or a
+        // plain connection would leave it running
+        assert!(args.windows(2).any(|a| a == ["-O", "exit"]));
+        assert!(args.windows(2).any(|a| a == ["-S", ctl_arg.as_str()]));
+        assert!(args.windows(2).any(|a| a == ["-o", "BatchMode=yes"]));
+        assert_eq!(args.last().unwrap(), &host.target);
+    }
+
+    #[test]
+    fn docker_hosts_have_no_control_master_to_close() {
+        let mut host = ssh_host("box");
+        host.kind = crate::config::HostKind::DockerContainer("devcontainer".into());
+        assert_eq!(control_exit_argv(&host, Path::new("/tmp/box.ctl")), None);
+
+        host.kind = crate::config::HostKind::DockerFolder("/work".into());
+        assert_eq!(control_exit_argv(&host, Path::new("/tmp/box.ctl")), None);
+    }
+
+    /// Fresh state dir, kept SHORT on purpose: a host's ControlPath has to fit
+    /// sockaddr_un's 104 bytes, and `test_path`'s nanosecond stamp alone can
+    /// push a real socket bind over that under a long $TMPDIR.
+    fn test_state_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hm-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn absent_control_socket_closes_nothing_and_logs_nothing() {
+        // tearing down a host that never connected must stay silent rather
+        // than run a doomed `-O exit` and report it as a teardown fault
+        let state_dir = test_state_dir("no-ctl");
+
+        close_control_master(&ssh_host("work"), &state_dir, &Logger::new(&state_dir, false)).await;
+
+        assert!(
+            !state_dir.join("daemon.log").exists(),
+            "logged about a socket that never existed"
+        );
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[tokio::test]
+    async fn dead_control_socket_is_removed_so_the_next_master_can_bind() {
+        let state_dir = test_state_dir("dead-ctl");
+        let ctl = control_path(&state_dir, "work");
+        // a master that already died leaves its socket file behind; `-O exit`
+        // then fails and only the explicit unlink clears the path
+        drop(std::os::unix::net::UnixListener::bind(&ctl).unwrap());
+
+        close_control_master(&ssh_host("work"), &state_dir, &Logger::new(&state_dir, false)).await;
+
+        assert!(!ctl.exists(), "stale control socket survived teardown");
+        let log = fs::read_to_string(state_dir.join("daemon.log")).unwrap();
+        assert!(
+            log.contains("control master"),
+            "teardown said nothing about the master: {log}"
+        );
+        let _ = fs::remove_dir_all(&state_dir);
     }
 
     #[test]

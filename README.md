@@ -314,11 +314,21 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# state_token = "frota"  # metadata token the host's connection state is
+                         # written to, so a machine that fell off shows it on
+                         # its sidebar rows. Set "" to turn the marker off.
+                         # Only rendered where your herdr config names it —
+                         # see "Host down marker" below.
+# down_label = "⚠ fora do ar"
+                         # value written into state_token while the host is
+                         # unreachable; cleared on reconnect.
 
 [hosts.work]
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
-# remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
+# remote_bin = "~/.local/bin/bora"   # explicit remote path. Unset resolves, in
+                                     # order: bora, herdr, ~/.local/bin/bora,
+                                     # ~/.local/bin/herdr
 # session = "project"                # mirror a named herdr session on this host
                                      # (`herdr --session project`)
 # max_cols = 212                     # per-host size cap; pairs with
@@ -395,6 +405,35 @@ Locally, name it in a sidebar row (`~/.config/herdr/config.toml`):
 [ui.sidebar.agents]
 rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 ```
+
+### Host down marker
+
+When a host stops answering, the daemon writes `down_label` (default
+`⚠ fora do ar`) into the `state_token` metadata token — default name `frota` —
+on every mirror workspace that host owns, and clears it on the next successful
+reconnect. Without it, a machine that fell off looks healthy in the sidebar:
+the pane says `reconnecting in 10s`, but you have to open it to find out.
+
+It is written once per transition, not once per retry, and carries no TTL: a
+marker that expired on its own would quietly show a dead machine as fine again.
+Clearing it is the reconnect's job.
+
+**You must name the token in your sidebar layout or you will never see it.**
+herdr renders a custom token only where the layout references it, `$`-prefixed:
+
+```toml
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace", "$frota"], ["branch", "git_status"]]
+```
+
+Declaring `rows` **replaces** the defaults, it does not add to them — the
+default is exactly `[["state_icon", "workspace"], ["branch", "git_status"]]`,
+so the example above restates it alongside `$frota`. Paste half of it and you
+lose your branch row.
+
+The two names must match: `state_token = "frota"` in `hosts.toml` is referenced
+as `"$frota"` in the herdr config. The `$` is herdr's reference syntax, not part
+of the token name. Set `state_token = ""` to turn the marker off entirely.
 
 ## Creation directories
 

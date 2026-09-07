@@ -10,22 +10,28 @@ use crate::util::{err, Result};
 /// Shell expression for `exec <expr> <command> ...` on the remote.
 ///
 /// A configured path is used as-is (unquoted so remote-shell `~` expands).
-/// When unset, `herdr` is resolved via PATH, falling back to
-/// `~/.local/bin/herdr` if `command -v` finds nothing. A configured session is
-/// added as Herdr's global `--session` option so every remote command selects
-/// the same server.
+/// When unset, the remote binary is resolved in this order: `bora` and `herdr`
+/// on PATH, then `~/.local/bin/bora` and `~/.local/bin/herdr`. `bora` comes
+/// first because this fork's own fleet renames the binary, and the upstream
+/// order (`herdr` only) makes auto-resolution useless there: a non-interactive
+/// `ssh host cmd` PATH does not include `~/.local/bin` on macOS, so a
+/// bora-named remote failed with `command not found: bora` and forced an
+/// absolute `remote_bin` on every host. A configured session is added as the
+/// global `--session` option so every remote command selects the same server.
 pub fn remote_herdr_expr(remote_bin: Option<&str>, session: Option<&str>) -> String {
     let bin = match remote_bin {
         Some(b) if !b.is_empty() => b.to_string(),
-        // The `$(...)` substitution must run under a POSIX sh, never the remote
-        // login shell: `ssh host cmd` hands the string to that shell, and fish
-        // rejects `$(...)` (in command position always; everywhere before fish
-        // 3.4), as does csh. The login shell only has to parse `sh -c
-        // '<literal>' herdr` plus the caller's trailing words, which every
-        // shell handles alike; the args land in `"$@"`. Quotes around the
-        // substitution prevent word-splitting if the resolved path contains
-        // spaces; ~ still expands inside the unquoted `echo` arg.
-        _ => "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr".into(),
+        // The loop must run under a POSIX sh, never the remote login shell:
+        // `ssh host cmd` hands the string to that shell, and fish rejects
+        // `$(...)` (in command position always; everywhere before fish 3.4),
+        // as does csh. The login shell only has to parse `sh -c '<literal>'
+        // bora` plus the caller's trailing words, which every shell handles
+        // alike; the args land in `"$@"`. `~` expands in the unquoted `for`
+        // list, and `command -v` on an absolute path answers only when it is
+        // executable, so a missing file falls through to the next candidate.
+        // The explicit 127 with a message on stderr matters: a silent failure
+        // here surfaces three layers up as an empty snapshot.
+        _ => "sh -c 'for b in bora herdr ~/.local/bin/bora ~/.local/bin/herdr; do p=$(command -v \"$b\" 2>/dev/null) && exec \"$p\" \"$@\"; done; echo \"no bora or herdr on the remote PATH or in ~/.local/bin\" >&2; exit 127' bora".into(),
     };
     match session {
         Some(session) => format!("{bin} --session {}", shell_quote(session)),
@@ -129,6 +135,16 @@ pub struct MirrorConfig {
     /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
+    /// Metadata token this plugin writes the host's connection state into, so
+    /// a machine that fell off is visible from its sidebar row instead of only
+    /// from inside a mirror pane. Empty disables the marker entirely.
+    ///
+    /// The name must match the `$`-prefixed reference in the local herdr
+    /// config's `[ui.sidebar.spaces] rows` — herdr renders a custom token only
+    /// where the layout names it.
+    pub state_token: String,
+    /// Value written into `state_token` while the host is unreachable.
+    pub down_label: String,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -151,12 +167,19 @@ impl MirrorConfig {
     }
 }
 
+/// Token name the connection-state marker uses when `state_token` is unset.
+/// Referenced as `$frota` in herdr's `[ui.sidebar.spaces] rows`.
+const DEFAULT_STATE_TOKEN: &str = "frota";
+const DEFAULT_DOWN_LABEL: &str = "⚠ fora do ar";
+
 #[derive(Deserialize)]
 struct RawConfig {
     autostart: Option<bool>,
     poll_seconds: Option<u64>,
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
+    state_token: Option<String>,
+    down_label: Option<String>,
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
@@ -348,6 +371,15 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        // Empty is meaningful here, unlike everywhere else in this file: it is
+        // how the marker is turned off. An empty down_label is not — a blank
+        // token value would render as a mystery gap in the row — so that one
+        // falls back to the default like remote_bin does.
+        state_token: raw.state_token.unwrap_or_else(|| DEFAULT_STATE_TOKEN.into()),
+        down_label: raw
+            .down_label
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_DOWN_LABEL.into()),
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -483,13 +515,84 @@ mod tests {
             remote_herdr_expr(Some("~/.local/bin/herdr"), Some("work")),
             "~/.local/bin/herdr --session 'work'"
         );
-        let auto = "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr";
-        assert_eq!(remote_herdr_expr(None, None), auto);
-        assert_eq!(remote_herdr_expr(Some(""), None), auto);
+        let auto = remote_herdr_expr(None, None);
+        assert_eq!(remote_herdr_expr(Some(""), None), auto, "empty means unset");
         assert_eq!(
             remote_herdr_expr(None, Some("team's")),
-            format!("{auto} --session 'team'\\''s'")
+            format!("{auto} --session 'team'\\''s'"),
+            "the session option must survive the sh -c wrapper, quote and all"
         );
+    }
+
+    /// The auto-resolver is executed by a remote shell, so the honest test is
+    /// to run it under a real `sh` against fake binaries and see which one it
+    /// execs — a string comparison against a second copy of the expression
+    /// proves only that someone typed it twice.
+    ///
+    /// Why this test exists: upstream resolved `herdr` only, and a
+    /// non-interactive `ssh host cmd` PATH excludes `~/.local/bin` on macOS,
+    /// so against a bora-named remote every command died with
+    /// `zsh:1: command not found: bora` and the plugin reported an empty
+    /// snapshot with no other clue. Measured in a live trial, 2026-09-07.
+    #[test]
+    fn auto_resolution_prefers_bora_then_herdr_then_local_bin() {
+        let root = tmpdir("auto-resolve");
+        let bin = root.join("bin");
+        let home_bin = root.join("home/.local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home_bin).unwrap();
+
+        let stub = |dir: &Path, name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\necho picked {name} \"$@\"\n")).unwrap();
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+        };
+
+        // A real remote PATH always has `sh`; only bora/herdr are in question.
+        // Handing `/nonexistent` alone makes the OUTER shell fail to find `sh`
+        // and the test measures nothing.
+        let base = format!("{}:/bin:/usr/bin", bin.display());
+        // `<expr> status` is exactly the shape every caller builds.
+        let run = |path: &str| {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{} status", remote_herdr_expr(None, None)))
+                .env("PATH", path)
+                .env("HOME", root.join("home"))
+                .output()
+                .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            )
+        };
+
+        // Nothing anywhere: a loud 127, never a silent success.
+        let (code, stdout, stderr) = run(&base);
+        assert_eq!(code, Some(127), "no binary must fail loudly: {stderr}");
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("bora"), "the message must name what it wanted: {stderr}");
+
+        // Only ~/.local/bin, which is precisely the case a non-interactive
+        // ssh PATH hides.
+        stub(&home_bin, "bora");
+        let (code, stdout, _) = run(&base);
+        assert_eq!((code, stdout.as_str()), (Some(0), "picked bora status"));
+
+        // On PATH, herdr alone still works: upstream fleets are not broken.
+        stub(&bin, "herdr");
+        let (code, stdout, _) = run(&base);
+        assert_eq!((code, stdout.as_str()), (Some(0), "picked herdr status"));
+
+        // Both on PATH: bora wins, because this fork renames the binary.
+        stub(&bin, "bora");
+        let (code, stdout, _) = run(&base);
+        assert_eq!((code, stdout.as_str()), (Some(0), "picked bora status"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

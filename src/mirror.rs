@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::ApiClient;
-use crate::config::HostConfig;
+use crate::config::{HostConfig, MirrorConfig};
 use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
 use crate::util::{Logger, Result};
 
@@ -375,6 +375,122 @@ fn map_status(remote: &str) -> &'static str {
 
 pub fn mirror_source(host_name: &str) -> String {
     format!("plugin:mirror:{host_name}")
+}
+
+/// Host connection state, as far as the sidebar is concerned.
+///
+/// `Unknown` is where every host task starts, and it exists so the FIRST
+/// successful connect still emits a clear. Metadata tokens live in the local
+/// server, not in our state file: a daemon killed while a host was down leaves
+/// the marker written, and starting out as `Up` would leave that stale marker
+/// on screen for the whole next daemon's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    Unknown,
+    Up,
+    Down,
+}
+
+/// One metadata token write against one mirror workspace. `None` clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenOp {
+    pub workspace_id: String,
+    pub value: Option<String>,
+}
+
+/// What to write when a host's link changes state. Pure: no api, no state
+/// file, no clock — the daemon loop only executes what comes back.
+///
+/// Emits on the TRANSITION only. The reconnect ladder retries a dead host
+/// three times in 45s and forever after that; re-stamping the same value on
+/// every rung would be one RPC per mirror per rung to say nothing new.
+pub fn token_ops(
+    prev: &LinkState,
+    now: &LinkState,
+    cfg: &MirrorConfig,
+    ids: &[String],
+) -> Vec<TokenOp> {
+    if cfg.state_token.is_empty() || prev == now {
+        return Vec::new();
+    }
+    let value = match now {
+        LinkState::Down => Some(cfg.down_label.clone()),
+        LinkState::Up => None,
+        // only ever the state a host task starts from, never entered again
+        LinkState::Unknown => return Vec::new(),
+    };
+    // An empty `ids` falls out as an empty plan: a host with no mirror
+    // workspaces has no sidebar row to mark.
+    ids.iter().map(|id| TokenOp { workspace_id: id.clone(), value: value.clone() }).collect()
+}
+
+/// Local ids of this host's live mirror workspaces — the rows a link-state
+/// marker belongs on. Tombstoned entries are skipped: the user closed those
+/// mirrors, and herdr recycles freed ids, so their stale local id may now
+/// belong to somebody else's workspace.
+///
+/// Takes the state rather than reading it, so the reconnect path can use the
+/// map `converge` just returned instead of re-parsing the file behind it.
+pub fn mirror_workspace_ids(state: &HostState) -> Vec<String> {
+    state
+        .workspaces
+        .values()
+        .filter(|e| !e.is_tombstoned())
+        .map(|e| e.local_id.clone())
+        .collect()
+}
+
+/// Execute a `token_ops` plan. Best-effort by design: a failed write costs one
+/// log line and nothing else — the marker is a hint about the host, and the
+/// host being unreachable is exactly when we are writing it.
+///
+/// No `ttl_ms`, deliberately. A marker that expires on its own turns back into
+/// "this machine looks fine" while nobody is mirroring it, and an optimistic
+/// lie is worse than a stale warning. Clearing is the reconnect's explicit act.
+pub async fn publish_token_ops(
+    local: &ApiClient,
+    host_name: &str,
+    token: &str,
+    ops: &[TokenOp],
+    log: &Logger,
+) {
+    if ops.is_empty() {
+        return;
+    }
+    let source = mirror_source(host_name);
+    let mut failed = 0usize;
+    for op in ops {
+        let value = match &op.value {
+            Some(v) => Value::String(v.clone()),
+            None => Value::Null,
+        };
+        // patch semantics per key (verified in herdr's metadata_tokens::patch):
+        // this touches only `token`, leaving the identity mark and the remote's
+        // forwarded tokens on the row alone.
+        let sent = local
+            .request(
+                "workspace.report_metadata",
+                json!({
+                    "workspace_id": op.workspace_id,
+                    "source": source,
+                    "tokens": { (token): value },
+                }),
+            )
+            .await;
+        if sent.is_err() {
+            failed += 1;
+        }
+    }
+    let verb = if ops[0].value.is_some() { "marked" } else { "cleared" };
+    if failed > 0 {
+        log.log(&format!(
+            "[{host_name}] sidebar {verb} {token} on {}/{} mirror(s) — {failed} write(s) failed",
+            ops.len() - failed,
+            ops.len()
+        ));
+    } else {
+        log.log(&format!("[{host_name}] sidebar {verb} {token} on {} mirror(s)", ops.len()));
+    }
 }
 
 /// Metadata token name this plugin stamps onto every mirror workspace it
@@ -2400,5 +2516,106 @@ mod tests {
         });
         let info: AgentInfo = serde_json::from_value(data).unwrap();
         assert!(!info.has_agent());
+    }
+
+    fn state_cfg(state_token: &str) -> MirrorConfig {
+        crate::config::parse_config(&format!(
+            "state_token = \"{state_token}\"\n[hosts.work]\ntarget = \"work\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn ids(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The whole point of the marker: a machine that fell off is visible from
+    /// the sidebar row, on every mirror workspace it owns.
+    #[test]
+    fn going_down_marks_every_mirror_row() {
+        let cfg = state_cfg("frota");
+        let ops = token_ops(&LinkState::Up, &LinkState::Down, &cfg, &ids(&["w7", "w8"]));
+        assert_eq!(
+            ops,
+            vec![
+                TokenOp { workspace_id: "w7".into(), value: Some(cfg.down_label.clone()) },
+                TokenOp { workspace_id: "w8".into(), value: Some(cfg.down_label.clone()) },
+            ]
+        );
+    }
+
+    /// Nothing expires this marker on its own (no ttl_ms, deliberately), so a
+    /// reconnect that forgets to clear leaves every row lying about a host
+    /// that is back up — for the daemon's whole life.
+    #[test]
+    fn reconnecting_clears_the_marker() {
+        let cfg = state_cfg("frota");
+        let ops = token_ops(&LinkState::Down, &LinkState::Up, &cfg, &ids(&["w7"]));
+        assert_eq!(ops, vec![TokenOp { workspace_id: "w7".into(), value: None }]);
+    }
+
+    /// A first connect clears too: metadata lives in the local server, and a
+    /// daemon killed while the host was down left the marker written there.
+    #[test]
+    fn first_connect_clears_a_marker_left_by_a_dead_daemon() {
+        let cfg = state_cfg("frota");
+        let ops = token_ops(&LinkState::Unknown, &LinkState::Up, &cfg, &ids(&["w7"]));
+        assert_eq!(ops, vec![TokenOp { workspace_id: "w7".into(), value: None }]);
+    }
+
+    /// The reconnect ladder retries three times in 45s and then forever. Only
+    /// the transition may emit, or a host that has been down since yesterday
+    /// costs one RPC per mirror every 30s to repeat itself.
+    #[test]
+    fn staying_down_emits_nothing() {
+        let cfg = state_cfg("frota");
+        assert!(token_ops(&LinkState::Down, &LinkState::Down, &cfg, &ids(&["w7"])).is_empty());
+        assert!(token_ops(&LinkState::Up, &LinkState::Up, &cfg, &ids(&["w7"])).is_empty());
+    }
+
+    #[test]
+    fn an_empty_state_token_disables_the_marker() {
+        let cfg = state_cfg("");
+        assert!(token_ops(&LinkState::Up, &LinkState::Down, &cfg, &ids(&["w7"])).is_empty());
+        assert!(token_ops(&LinkState::Down, &LinkState::Up, &cfg, &ids(&["w7"])).is_empty());
+    }
+
+    /// A host with no mirror workspaces has no row to mark.
+    #[test]
+    fn a_host_without_mirrors_emits_nothing() {
+        let cfg = state_cfg("frota");
+        assert!(token_ops(&LinkState::Up, &LinkState::Down, &cfg, &[]).is_empty());
+    }
+
+    /// The daemon's own bookkeeping, replayed: a host that drops, retries
+    /// three times on the ladder, then comes back. Exactly one mark and one
+    /// clear reach the sidebar — 45s of retries add nothing, and the row does
+    /// not stay warning about a host that is already back.
+    #[test]
+    fn a_full_flap_marks_once_and_clears_once() {
+        let cfg = state_cfg("frota");
+        let rows = ids(&["w7"]);
+        let mut link = LinkState::Unknown;
+        let mut emitted: Vec<TokenOp> = Vec::new();
+        // Unknown → Up (first connect) → Down → Down ×3 (backoff) → Up
+        for next in [
+            LinkState::Up,
+            LinkState::Down,
+            LinkState::Down,
+            LinkState::Down,
+            LinkState::Down,
+            LinkState::Up,
+        ] {
+            emitted.extend(token_ops(&link, &next, &cfg, &rows));
+            link = next;
+        }
+        assert_eq!(
+            emitted,
+            vec![
+                TokenOp { workspace_id: "w7".into(), value: None },
+                TokenOp { workspace_id: "w7".into(), value: Some(cfg.down_label.clone()) },
+                TokenOp { workspace_id: "w7".into(), value: None },
+            ]
+        );
     }
 }
