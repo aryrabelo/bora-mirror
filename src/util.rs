@@ -344,6 +344,18 @@ pub fn reject_control(s: &str, what: &str) -> Result<()> {
     }
 }
 
+/// Random per-generation identity for object checks: the mirror stamps it as
+/// metadata token `mirror_mark` and compares before closing anything mapped.
+/// Nanotime+pid — not cryptographic; it only has to differ between server
+/// generations and between two stamps taken in the same run.
+pub fn fresh_identity_mark() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{nanos:x}-{:x}", std::process::id())
+}
+
 pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
     state_dir
         .join("streamer-pids")

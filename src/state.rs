@@ -68,6 +68,14 @@ pub struct TabEntry {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostState {
+    /// identity stamped as the `mirror_mark` metadata token (see
+    /// mirror::IDENTITY_TOKEN) onto every mirror workspace this host manages.
+    /// Local ids are recycled after a server restart (closes.rs: freed ids get
+    /// reused), so a close is only issued when the object at the mapped id
+    /// still carries this mark. `default`: state files from before the guard
+    /// have none and keep the old behavior until the first stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<String>,
     #[serde(default)]
     pub workspaces: BTreeMap<String, WsEntry>,
     #[serde(default)]

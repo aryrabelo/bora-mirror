@@ -312,11 +312,10 @@ pub async fn apply_hidden(
         return;
     }
     let mut state = load_state(state_dir, host_name);
-    // only ids herdr still shows. Note this filters ids that are GONE, not ids
-    // that now belong to someone else: a local server restart can reassign one,
-    // and this cannot tell. Converge's own close paths share that weakness.
-    let live: std::collections::HashSet<String> = match fetch_snapshot(local).await {
-        Ok(snap) => snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect(),
+    // only ids herdr still shows. A local server restart can reassign an id
+    // to someone else's object — the identity mark, not the id alone, decides.
+    let snap = match fetch_snapshot(local).await {
+        Ok(snap) => snap,
         Err(e) => {
             // the one path where hide legitimately does nothing; say so, or the
             // mirrors stay up with no explanation anywhere
@@ -324,6 +323,8 @@ pub async fn apply_hidden(
             return;
         }
     };
+    let live: std::collections::HashSet<String> =
+        snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
     let doomed = hidden_close_plan(hidden, &mut state, &live);
     if doomed.is_empty() {
         return;
@@ -333,6 +334,15 @@ pub async fn apply_hidden(
         return;
     }
     for local_id in &doomed {
+        // the hole this closes was confessed in the comment that used to sit
+        // by the snapshot fetch: an id alone cannot be told apart after a
+        // restart, so an object without our mark is simply not ours to close
+        if !still_ours(&snap, state.mark.as_ref(), local_id) {
+            log.log(&format!(
+                "hidden — {local_id} no longer carries our identity mark; not closing it (recycled id?)"
+            ));
+            continue;
+        }
         log.log(&format!("hidden — closing mirror workspace {local_id}"));
         if let Ok(mut t) = closes.lock() {
             t.mark_self_close(local_id);
@@ -365,6 +375,51 @@ fn map_status(remote: &str) -> &'static str {
 
 pub fn mirror_source(host_name: &str) -> String {
     format!("plugin:mirror:{host_name}")
+}
+
+/// Metadata token name this plugin stamps onto every mirror workspace it
+/// creates, holding the host's identity mark (`HostState::mark`). All sources
+/// share one flat token namespace — including remotes' forwarded tokens — so
+/// the name must be unambiguously ours.
+pub const IDENTITY_TOKEN: &str = "mirror_mark";
+
+/// True when the local object `local_id` — a workspace itself, or a tab/pane
+/// reached through its owning workspace — still carries the host's identity
+/// mark. Local ids are recycled after a server restart (see closes.rs), so
+/// every close below is gated on this. A None mark means a state file from
+/// before the guard: keep the old behavior rather than wedge.
+fn still_ours(snap: &Snapshot, mark: Option<&String>, local_id: &str) -> bool {
+    let Some(mark) = mark else { return true };
+    let carries = |ws_id: &str| {
+        snap.workspaces.iter().any(|w| {
+            w.workspace_id == ws_id
+                && w.tokens.get(IDENTITY_TOKEN).map(String::as_str) == Some(mark.as_str())
+        })
+    };
+    if carries(local_id) {
+        return true;
+    }
+    let owner = snap
+        .tabs
+        .iter()
+        .find(|t| t.tab_id == local_id)
+        .map(|t| t.workspace_id.as_str())
+        .or_else(|| {
+            snap.panes.iter().find(|p| p.pane_id == local_id).map(|p| p.workspace_id.as_str())
+        });
+    owner.is_some_and(carries)
+}
+
+/// Stamp (or re-stamp) the host's identity mark onto a local workspace's
+/// metadata. Best-effort: the existing-branch heal re-stamps when a snapshot
+/// later shows the mark missing.
+async fn stamp_identity(local: &ApiClient, source: &str, local_id: &str, mark: &str) {
+    let _ = local
+        .request(
+            "workspace.report_metadata",
+            json!({ "workspace_id": local_id, "source": source, "tokens": { (IDENTITY_TOKEN): mark } }),
+        )
+        .await;
 }
 
 /// The server rejects custom_status longer than this.
@@ -951,6 +1006,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     for rid in gone_ws {
         let entry = state.workspaces.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_ws_ids.contains(&entry.local_id) {
+            if !still_ours(&local_snap, state.mark.as_ref(), &entry.local_id) {
+                log.log(&format!(
+                    "remote workspace {rid} gone, but mirror {} lost our identity mark — not closing it (recycled id?)",
+                    entry.local_id
+                ));
+                continue;
+            }
             log.log(&format!("remote workspace {rid} gone — closing mirror {}", entry.local_id));
             mark_self_close(deps, &entry.local_id);
             if let Err(e) = deps.local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await {
@@ -963,6 +1025,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     for rid in gone_tabs {
         let entry = state.tabs.remove(&rid).unwrap();
         if local_tab_ids.contains(entry.local_id.as_str()) {
+            if !still_ours(&local_snap, state.mark.as_ref(), &entry.local_id) {
+                log.log(&format!(
+                    "remote tab {rid} gone, but local tab {} lost our identity mark — not closing it",
+                    entry.local_id
+                ));
+                continue;
+            }
             let _ = deps.local.request("tab.close", json!({ "tab_id": entry.local_id })).await;
         }
     }
@@ -971,6 +1040,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     for rid in gone_panes {
         let entry = state.panes.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_pane_ids.contains(entry.local_id.as_str()) {
+            if !still_ours(&local_snap, state.mark.as_ref(), &entry.local_id) {
+                log.log(&format!(
+                    "remote pane {rid} gone, but local pane {} lost our identity mark — not closing it",
+                    entry.local_id
+                ));
+                continue;
+            }
             mark_self_close(deps, &entry.local_id);
             let _ = deps.local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
         }
@@ -1016,6 +1092,34 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if let Some(entry) = existing {
             let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
             if let Some(lws) = local_ws {
+                // Identity guard: local ids are recycled after a server
+                // restart, so the object at local_id must still carry this
+                // host's mark. A missing mark is re-stamped (a report can
+                // fail, a restart can wipe tokens). A DIFFERENT value means a
+                // stranger owns the id: drop the stale entry; the create
+                // branch below rebuilds the mirror on a later pass.
+                let expected =
+                    state.mark.get_or_insert_with(crate::util::fresh_identity_mark).clone();
+                match lws.tokens.get(IDENTITY_TOKEN) {
+                    Some(v) if v == &expected => {}
+                    Some(_) => {
+                        log.log(&format!(
+                            "identity mark mismatch on {} — dropping stale map entry (recycled id?)",
+                            entry.local_id
+                        ));
+                        state.workspaces.remove(&rws.workspace_id);
+                        continue;
+                    }
+                    None => {
+                        stamp_identity(
+                            &deps.local,
+                            &mirror_source(&host.name),
+                            &entry.local_id,
+                            &expected,
+                        )
+                        .await;
+                    }
+                }
                 // mirrors created before the machine-folder change get filed
                 // under this host's folder on the first pass they differ
                 if lws.visual_group.as_deref() != Some(host.name.as_str()) {
@@ -1087,6 +1191,16 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         json!({ "workspace_id": orphan.workspace_id, "group": host.name }),
                     )
                     .await;
+                // stamp the current host identity so closes on the adopted
+                // workspace stay guarded from now on (and any stale mark from
+                // a previous generation is refreshed)
+                stamp_identity(
+                    &deps.local,
+                    &mirror_source(&host.name),
+                    &orphan.workspace_id,
+                    state.mark.get_or_insert_with(crate::util::fresh_identity_mark),
+                )
+                .await;
                 WsEntry {
                     local_id: orphan.workspace_id.clone(),
                     tombstone: None,
@@ -1120,6 +1234,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     .local
                     .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false, "group": host.name }))
                     .await?;
+                stamp_identity(
+                    &deps.local,
+                    &mirror_source(&host.name),
+                    &created.workspace.workspace_id,
+                    state.mark.get_or_insert_with(crate::util::fresh_identity_mark),
+                )
+                .await;
                 WsEntry {
                     local_id: created.workspace.workspace_id,
                     tombstone: None,
@@ -1561,19 +1682,50 @@ pub async fn apply_remote_closes(
     }
     let mut state = load_state(state_dir, host_name);
     let mut changed = false;
+    // Identity evidence for the guards below. If the snapshot fails we cannot
+    // tell a mirror from a recycled id, so nothing is closed here; the next
+    // converge's absence sweep redoes the work under the same guards.
+    let snap = match fetch_snapshot(local).await {
+        Ok(s) => s,
+        Err(e) => {
+            log.log(&format!("[{host_name}] identity check unavailable ({e}); closing skipped"));
+            return;
+        }
+    };
     for rid in closed {
         if let Some(entry) = state.workspaces.remove(rid) {
             changed = true;
             if !entry.is_tombstoned() {
+                if !still_ours(&snap, state.mark.as_ref(), &entry.local_id) {
+                    log.log(&format!(
+                        "[{host_name}] workspace {rid}: mirror {} lost our identity mark — not closing (recycled id?)",
+                        entry.local_id
+                    ));
+                    continue;
+                }
                 log.log(&format!("remote workspace {rid} closed — closing mirror {}", entry.local_id));
                 let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
             }
         } else if let Some(entry) = state.tabs.remove(rid) {
             changed = true;
+            if !still_ours(&snap, state.mark.as_ref(), &entry.local_id) {
+                log.log(&format!(
+                    "[{host_name}] tab {rid}: local tab {} lost our mark — not closing",
+                    entry.local_id
+                ));
+                continue;
+            }
             let _ = local.request("tab.close", json!({ "tab_id": entry.local_id })).await;
         } else if let Some(entry) = state.panes.remove(rid) {
             changed = true;
             if !entry.is_tombstoned() {
+                if !still_ours(&snap, state.mark.as_ref(), &entry.local_id) {
+                    log.log(&format!(
+                        "[{host_name}] pane {rid}: local pane {} lost our mark — not closing",
+                        entry.local_id
+                    ));
+                    continue;
+                }
                 let _ = local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
             }
         }
@@ -1633,6 +1785,18 @@ pub async fn teardown(
     closes: Option<&crate::closes::Closes>,
 ) -> Result<()> {
     let state = load_state(state_dir, host_name);
+    // Identity evidence for the close loop below: teardown closes mapped ids,
+    // and a server restart can hand those ids to someone else's objects.
+    let snap = match fetch_snapshot(local).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Safe direction: mirrors left open are recoverable (a later
+            // teardown or a manual close gets them); closing a recycled id
+            // destroys a stranger's workspace. The map is still intact here.
+            log.log(&format!("teardown: snapshot failed ({e}); mirrors left unclosed"));
+            return Ok(());
+        }
+    };
     // Wipe the id map BEFORE closing the local windows. teardown (and the
     // restart / zombie-heal that call it) means "stop mirroring here" — never
     // "close the remote sessions". But close_remote_on_local_close fires when a
@@ -1647,6 +1811,13 @@ pub async fn teardown(
     // explanation of why
     let _ = crate::state::set_hidden(state_dir, host_name, false);
     for entry in state.workspaces.values() {
+        if !still_ours(&snap, state.mark.as_ref(), &entry.local_id) {
+            log.log(&format!(
+                "teardown: mirror {} lost our identity mark — not closing it (recycled id?)",
+                entry.local_id
+            ));
+            continue;
+        }
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         // ours, not the user's: the heal re-adopts these ids, so without the mark
         // the echoing close event would later read as "user closed the mirror"
