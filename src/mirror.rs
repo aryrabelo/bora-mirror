@@ -31,6 +31,10 @@ pub struct WsInfo {
     /// pre-0.7.4 remote never sends this.
     #[serde(default)]
     pub tokens: HashMap<String, String>,
+    /// folder the local sidebar files this workspace under. Only the LOCAL
+    /// server sends it; remotes leave it absent.
+    #[serde(default)]
+    pub visual_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -997,6 +1001,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if let Some(entry) = existing {
             let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
             if let Some(lws) = local_ws {
+                // mirrors created before the machine-folder change get filed
+                // under this host's folder on the first pass they differ
+                if lws.visual_group.as_deref() != Some(host.name.as_str()) {
+                    let _ = deps
+                        .local
+                        .request(
+                            "workspace.set_group",
+                            json!({ "workspace_id": entry.local_id, "group": host.name }),
+                        )
+                        .await;
+                }
                 match resolve_label(Some(&host.prefix), &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
                     LabelAction::PushRemote(new_remote) => {
                         // the user renamed the mirror → the rename is intent for
@@ -1048,6 +1063,15 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 .find(|w| w.label == label && !mapped.contains(w.workspace_id.as_str()));
             let entry = if let Some(orphan) = orphan {
                 log.log(&format!("adopting existing workspace {label} ({})", orphan.workspace_id));
+                // adopted workspaces never went through create, so their
+                // machine folder has to be set (or refreshed) explicitly
+                let _ = deps
+                    .local
+                    .request(
+                        "workspace.set_group",
+                        json!({ "workspace_id": orphan.workspace_id, "group": host.name }),
+                    )
+                    .await;
                 WsEntry {
                     local_id: orphan.workspace_id.clone(),
                     tombstone: None,
@@ -1079,7 +1103,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 let created: Created = deps
                     .local
-                    .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false }))
+                    .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false, "group": host.name }))
                     .await?;
                 WsEntry {
                     local_id: created.workspace.workspace_id,
