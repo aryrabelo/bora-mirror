@@ -670,6 +670,21 @@ pub(crate) async fn spawn_streamer_pane(
     argv: &[String],
     log: &Logger,
 ) {
+    // Everything below gets TYPED onto a shell command line (the exec line),
+    // and sh_quote only escapes single quotes. The remote pane id arrives
+    // from the remote's snapshot, so reject control bytes instead of
+    // trusting the quote to make them safe. Checked BEFORE the spawn claim:
+    // a refusal must not leave a stale claim behind.
+    for (i, arg) in argv.iter().enumerate() {
+        if let Err(e) = crate::util::reject_control(arg, &format!("streamer argv[{i}]")) {
+            log.log(&format!("refusing streamer command for {local_pane_id}: {e}"));
+            return;
+        }
+    }
+    if let Err(e) = crate::util::reject_control(local_pane_id, "local pane id") {
+        log.log(&format!("refusing streamer command: {e}"));
+        return;
+    }
     let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
     else {
         log.log(&format!("refusing malformed streamer command for {local_pane_id}"));

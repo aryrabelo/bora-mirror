@@ -328,6 +328,22 @@ pub fn sane_component(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
 }
 
+/// Refuse — never silently rewrite — a string about to be typed onto a pane's
+/// shell command line. `sh_quote` only escapes single quotes, so a control
+/// byte smuggled inside a remote-supplied id survives quoting and is TYPED
+/// into the pane: `\n` would run a second command, `\x03`/`\x1b` poke the
+/// terminal itself. Ids are rejected outright so the failure is loud, in the
+/// same spirit as `valid_key` (refused, not escaped).
+pub fn reject_control(s: &str, what: &str) -> Result<()> {
+    match s.char_indices().find(|(_, c)| c.is_control()) {
+        None => Ok(()),
+        Some((i, c)) => Err(err(format!(
+            "{what} contains control char U+{:04X} at byte offset {i}; refusing to type it",
+            c as u32
+        ))),
+    }
+}
+
 pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
     state_dir
         .join("streamer-pids")
@@ -487,6 +503,12 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn an_id_with_a_control_char_is_rejected_and_a_plain_id_passes() {
+        assert!(reject_control("w1\x03p2", "pane id").is_err());
+        assert!(reject_control("w1:p2", "pane id").is_ok());
     }
 
     #[test]
