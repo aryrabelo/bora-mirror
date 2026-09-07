@@ -52,21 +52,49 @@ impl Env {
         let local_socket = match std::env::var("HERDR_SOCKET_PATH") {
             Ok(s) if !s.is_empty() => PathBuf::from(s),
             _ => {
-                let out = std::process::Command::new("herdr")
-                    .args(["status", "--json"])
-                    .output()
-                    .map_err(|e| err(format!("cannot run herdr status: {e}")))?;
-                let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-                let sock = parsed
-                    .pointer("/server/socket")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if sock.is_empty() {
-                    return Err(err(
-                        "cannot resolve local herdr socket (HERDR_SOCKET_PATH unset, herdr status gave none)",
-                    ));
+                // The local server's binary name follows the install: the bora
+                // fork renames it to `bora`, upstream ships `herdr`. An explicit
+                // HERDR_MIRROR_LOCAL_BIN wins; otherwise candidates are probed in
+                // order and a MISSING binary falls through to the next name — one
+                // that ran but misbehaved is the real error, not a reason to try
+                // another name.
+                let override_bin =
+                    std::env::var("HERDR_MIRROR_LOCAL_BIN").ok().filter(|s| !s.is_empty());
+                let candidates: &[&str] = match override_bin.as_deref() {
+                    Some(b) => &[b],
+                    None => &["bora", "herdr"],
+                };
+                let mut resolved: Option<PathBuf> = None;
+                let mut tried: Vec<String> = Vec::new();
+                for bin in candidates {
+                    match std::process::Command::new(bin).args(["status", "--json"]).output() {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            tried.push(format!("{bin}: not found in PATH"));
+                        }
+                        Err(e) => return Err(err(format!("cannot run {bin} status: {e}"))),
+                        Ok(out) => {
+                            let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+                                .map_err(|e| err(format!("{bin} status: bad JSON: {e}")))?;
+                            let sock = parsed
+                                .pointer("/server/socket")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if sock.is_empty() {
+                                tried.push(format!("{bin}: no socket in status output"));
+                            } else {
+                                resolved = Some(PathBuf::from(sock));
+                                break;
+                            }
+                        }
+                    }
                 }
-                PathBuf::from(sock)
+                resolved.ok_or_else(|| {
+                    err(format!(
+                        "cannot resolve local socket (HERDR_SOCKET_PATH unset; tried {})",
+                        tried.join("; ")
+                    ))
+                })?
             }
         };
         Ok(Env { config_search, state_dir, local_socket })
